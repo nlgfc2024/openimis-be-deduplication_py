@@ -311,7 +311,7 @@ def get_duplication_aggregation(model: Union[Type[ExtendableModel], Type[History
                          for key in json_ext_keys}
         queryset = queryset.annotate(**json_ext_aggr)
 
-    values = (columns or list()) + (json_ext_keys or list())
+    values = (columns or []) + (json_ext_keys or [])
 
     if not values:
         raise ValueError("At least one column required")
@@ -332,9 +332,11 @@ def get_duplication_benefit_aggregation(
                          for key in json_ext_keys}
         queryset = queryset.annotate(**json_ext_aggr)
 
-    individual_columns = ['first_name', 'last_name', 'dob']
+    from deduplication.apps import DeduplicationConfig
+    individual_columns = list(DeduplicationConfig.individual_basic_fields)
+    
     columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
-    values = (columns or list()) + (json_ext_keys or list())
+    values = (columns or []) + (json_ext_keys or [])
     if not values:
         raise ValueError("At least one column required")
 
@@ -399,13 +401,16 @@ def _update_instance_json_ext_if_different_value(instance, json_ext_kwargs, user
 
 @transaction.atomic
 def merge_duplicate_beneficiaries(task_data, user_id):
-    individual_fields = {"first_name", "last_name", "dob"}
+
     beneficiary_fields = {"status"}
+    
+    from deduplication.apps import DeduplicationConfig
+    individual_fields = set(DeduplicationConfig.individual_basic_fields)
 
     user = User.objects.get(id=user_id)
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
-    merge_data = list(additional_resolve_data.values())[0]
+    merge_data = next(iter(additional_resolve_data.values()))
     field_values = merge_data.get('values', {})
     beneficiary_ids = merge_data.get("beneficiaryIds", [])
 
@@ -455,7 +460,7 @@ def on_deduplication_task_complete_service_handler(**kwargs):
 def remove_duplicate_benefit_payments(task_data):
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
-    merge_data = list(additional_resolve_data.values())[0]
+    merge_data = next(iter(additional_resolve_data.values()))
     benefit_ids = merge_data.get("benefitIds", [])
     benefits_to_delete = BenefitConsumption.objects.filter(id__in=benefit_ids)\
         .values_list('id', 'benefitattachment__bill')
