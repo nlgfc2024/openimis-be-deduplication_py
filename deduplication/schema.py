@@ -1,7 +1,8 @@
 import graphene
 from django.contrib.auth.models import AnonymousUser
 
-from deduplication.gql_mutations import CreateDeduplicationReviewMutation, CreateDeduplicationPaymentReviewMutation, DeduplicationConfig
+from deduplication.apps import DeduplicationConfig
+from deduplication.gql_mutations import CreateDeduplicationReviewMutation, CreateDeduplicationPaymentReviewMutation
 from deduplication.gql_queries import DeduplicationSummaryGQLType, DeduplicationSummaryRowGQLType
 
 
@@ -23,7 +24,6 @@ class Query(graphene.ObjectType):
     individual_basic_fields = graphene.List(graphene.String)
 
     def resolve_individual_basic_fields(self, info, **kwargs):
-        from deduplication.apps import DeduplicationConfig
         return DeduplicationConfig.individual_basic_fields
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
@@ -35,14 +35,11 @@ class Query(graphene.ObjectType):
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
 
-        from deduplication.apps import DeduplicationConfig
-
-        individual_columns = list(DeduplicationConfig.individual_basic_fields)        
+        individual_columns = list(DeduplicationConfig.individual_basic_fields)
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
         aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
         rows = []
         for row in aggr:
-            individual_columns = [f'individual__{column}' for column in individual_columns]
             count = row.pop('id_count')
             ids = row.pop('ids')
             row_column_values = {column: str(row[column])
@@ -62,7 +59,6 @@ class Query(graphene.ObjectType):
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
 
-        from deduplication.apps import DeduplicationConfig
         individual_columns = list(DeduplicationConfig.individual_basic_fields)
         columns = [f'{column}' if column in individual_columns else column for column in columns]
 
