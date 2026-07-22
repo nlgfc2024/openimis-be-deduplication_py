@@ -16,6 +16,7 @@ from core.datetimes.ad_datetime import AdDate
 from core.models import ExtendableModel, HistoryModel, User, HistoryBusinessModel
 from core.services.utils import model_representation, output_exception
 from core.utils import to_json_safe_value
+from deduplication.apps import DeduplicationConfig
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
 from individual.models import Individual
@@ -332,9 +333,7 @@ def get_duplication_benefit_aggregation(
                          for key in json_ext_keys}
         queryset = queryset.annotate(**json_ext_aggr)
 
-    from deduplication.apps import DeduplicationConfig
     individual_columns = list(DeduplicationConfig.individual_basic_fields)
-    
     columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
     values = (columns or []) + (json_ext_keys or [])
     if not values:
@@ -403,13 +402,14 @@ def _update_instance_json_ext_if_different_value(instance, json_ext_kwargs, user
 def merge_duplicate_beneficiaries(task_data, user_id):
 
     beneficiary_fields = {"status"}
-    
-    from deduplication.apps import DeduplicationConfig
+
     individual_fields = set(DeduplicationConfig.individual_basic_fields)
 
     user = User.objects.get(id=user_id)
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
+    if not additional_resolve_data:
+        raise ValueError("Task json_ext is missing additional_resolve_data required to merge beneficiaries")
     merge_data = next(iter(additional_resolve_data.values()))
     field_values = merge_data.get('values', {})
     beneficiary_ids = merge_data.get("beneficiaryIds", [])
@@ -460,6 +460,8 @@ def on_deduplication_task_complete_service_handler(**kwargs):
 def remove_duplicate_benefit_payments(task_data):
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
+    if not additional_resolve_data:
+        raise ValueError("Task json_ext is missing additional_resolve_data required to remove duplicate benefit payments")
     merge_data = next(iter(additional_resolve_data.values()))
     benefit_ids = merge_data.get("benefitIds", [])
     benefits_to_delete = BenefitConsumption.objects.filter(id__in=benefit_ids)\
