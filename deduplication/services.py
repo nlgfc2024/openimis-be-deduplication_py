@@ -5,7 +5,11 @@ from typing import List, Union, Tuple, Type
 from datetime import datetime
 
 from django.contrib.postgres.aggregates import ArrayAgg
-from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ImproperlyConfigured,
+    PermissionDenied,
+)
 from django.db import models
 from django.db.models import Count, Q
 from django.db.models.fields.json import KeyTextTransform
@@ -316,17 +320,92 @@ def get_beneficiary_duplication_aggregation(
     return get_duplication_aggregation(Beneficiary, columns=db_columns, json_ext_keys=json_keys, filters=filters)
 
 
-def get_benefit_consumption_duplication_aggregation(columns: List[str] = None, payment_cycle_id: str = None):
+def _filter_payment_deduplication_links(queryset, user):
+    """Scope Payroll links and reject Payroll's legacy unrestricted fallback."""
+    from social_protection.apps import SocialProtectionConfig
+
+    if not getattr(
+        SocialProtectionConfig,
+        'enable_benefit_plan_access_control',
+        False,
+    ):
+        return queryset
+
+    user = getattr(getattr(user, 'context', None), 'user', user)
+    if user is None or getattr(user, 'is_anonymous', False):
+        raise PermissionDenied("Valid user context is required.")
+
+    try:
+        from social_protection.benefit_plan_access import (
+            get_accessible_benefit_plan_ids,
+        )
+    except ImportError as exc:
+        raise ImproperlyConfigured(
+            "Benefit Plan access control is enabled, but the shared Social "
+            "Protection authorization service is unavailable."
+        ) from exc
+
+    from payroll import benefit_plan_access as payroll_access
+
+    if (
+        payroll_access.get_accessible_benefit_plan_ids
+        is not get_accessible_benefit_plan_ids
+    ):
+        raise ImproperlyConfigured(
+            "Payroll Benefit Plan filtering is using an unrestricted "
+            "authorization fallback while access control is enabled."
+        )
+
+    return payroll_access.filter_payroll_queryset(
+        queryset,
+        user,
+        payroll_prefix='payroll',
+    )
+
+
+def get_benefit_consumption_duplication_aggregation(
+    columns: List[str] = None,
+    payment_cycle_id: str = None,
+    user=None,
+):
     if not columns:
         raise ValueError("At least one column required")
     if not payment_cycle_id:
         raise ValueError("Payment Cycle not specified")
 
     db_columns, json_keys = _resolve_columns(Individual, columns)
-    benefit_consumption_ids = PayrollBenefitConsumption.objects.filter(
+    cycle_links = PayrollBenefitConsumption.objects.filter(
+        is_deleted=False,
         payroll__payment_cycle_id=payment_cycle_id,
-        payroll__status=PayrollStatus.PENDING_APPROVAL
+        payroll__is_deleted=False,
+        payroll__status=PayrollStatus.PENDING_APPROVAL,
+    )
+    authorized_cycle_links = _filter_payment_deduplication_links(
+        cycle_links,
+        user,
+    )
+
+    # A historical Benefit Consumption can have more than one active Payroll
+    # link.  Exclude it if any active link is outside the caller's programme
+    # scope; users assigned to every linked programme still see it once.
+    candidate_ids = authorized_cycle_links.values_list(
+        'benefit_id', flat=True,
+    ).distinct()
+    active_candidate_links = PayrollBenefitConsumption.objects.filter(
+        is_deleted=False,
+        payroll__is_deleted=False,
+        benefit_id__in=candidate_ids,
+    )
+    authorized_active_links = _filter_payment_deduplication_links(
+        active_candidate_links,
+        user,
+    )
+    unauthorized_candidate_ids = active_candidate_links.exclude(
+        pk__in=authorized_active_links.values('pk'),
     ).values_list('benefit_id', flat=True)
+    benefit_consumption_ids = authorized_cycle_links.exclude(
+        benefit_id__in=unauthorized_candidate_ids,
+    ).values_list('benefit_id', flat=True).distinct()
 
     filters = [
         Q(id__in=benefit_consumption_ids),
