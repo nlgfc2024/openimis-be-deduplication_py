@@ -5,7 +5,7 @@ from typing import List, Union, Tuple, Type
 from datetime import datetime
 
 from django.contrib.postgres.aggregates import ArrayAgg
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
 from django.db import models
 from django.db.models import Count, Q
 from django.db.models.fields.json import KeyTextTransform
@@ -271,7 +271,40 @@ class CreateDeduplicationPaymentReviewTasksService:
         return fields_to_exclude
 
 
-def get_beneficiary_duplication_aggregation(columns: List[str] = None, benefit_plan_id: str = None):
+def _require_beneficiary_deduplication_access(user, benefit_plan_id):
+    """Use Track 01 authorization lazily and preserve feature-OFF behavior."""
+    try:
+        from social_protection.apps import SocialProtectionConfig
+    except ImportError:
+        return
+
+    if not getattr(
+        SocialProtectionConfig,
+        'enable_benefit_plan_access_control',
+        False,
+    ):
+        return
+
+    try:
+        from social_protection.benefit_plan_access import (
+            require_benefit_plan_access,
+        )
+    except ImportError as exc:
+        raise ImproperlyConfigured(
+            "Benefit Plan access control is enabled, but the shared Social "
+            "Protection authorization service is unavailable."
+        ) from exc
+
+    user = getattr(getattr(user, 'context', None), 'user', user)
+    require_benefit_plan_access(user, benefit_plan_id)
+
+
+def get_beneficiary_duplication_aggregation(
+    columns: List[str] = None,
+    benefit_plan_id: str = None,
+    user=None,
+):
+    _require_beneficiary_deduplication_access(user, benefit_plan_id)
     if not columns:
         raise ValueError("At least one column required")
     if not benefit_plan_id:
