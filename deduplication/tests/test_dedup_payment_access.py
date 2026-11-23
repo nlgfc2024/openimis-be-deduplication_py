@@ -1,4 +1,3 @@
-import sys
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
@@ -6,7 +5,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import PermissionDenied
 from django.test import TestCase, override_settings
 
 from contribution_plan.models import PaymentPlan
@@ -17,6 +16,7 @@ from core.test_helpers import (
 )
 from deduplication.schema import Query
 from deduplication.services import (
+    _payment_task_ownership,
     get_benefit_consumption_duplication_aggregation,
 )
 from individual.models import Individual
@@ -233,6 +233,18 @@ class PaymentDeduplicationAccessTest(TestCase):
         self.assertEqual(upg['UPG duplicate']['ids'], {
             benefit.id for benefit in self.upg_benefits
         })
+        self.assertEqual(
+            _payment_task_ownership(
+                [benefit.id for benefit in self.upg_benefits]
+            ),
+            {'benefit_plan_id': str(self.upg_plan.id)},
+        )
+        self.assertEqual(
+            _payment_task_ownership(
+                [benefit.id for benefit in self.legacy_benefits]
+            ),
+            {'benefit_plan_is_shared': True},
+        )
 
         rmep = self.summary(self.rmep_user)
         self.assertEqual(set(rmep), {'RMEP duplicate', 'Legacy duplicate'})
@@ -304,15 +316,9 @@ class PaymentDeduplicationAccessTest(TestCase):
             },
         )
 
-    def test_missing_authorization_dependency_and_payroll_fallback_fail_closed(self):
-        with patch.dict(
-            sys.modules,
-            {'social_protection.benefit_plan_access': None},
-        ), self.assertRaises(ImproperlyConfigured):
-            self.summary(self.upg_user)
-
+    def test_payroll_authorization_denial_is_not_bypassed(self):
         with patch(
-            'payroll.benefit_plan_access.get_accessible_benefit_plan_ids',
-            return_value=None,
-        ), self.assertRaises(ImproperlyConfigured):
+            'payroll.benefit_plan_access.filter_payroll_queryset',
+            side_effect=PermissionDenied("denied"),
+        ), self.assertRaises(PermissionDenied):
             self.summary(self.upg_user)

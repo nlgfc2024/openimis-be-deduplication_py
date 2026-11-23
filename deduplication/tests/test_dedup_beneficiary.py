@@ -1,11 +1,13 @@
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import PermissionDenied
 from django.test import TestCase, override_settings
 from django.db import connection
-from deduplication.services import get_beneficiary_duplication_aggregation
+from deduplication.services import (
+    _beneficiary_task_ownership,
+    get_beneficiary_duplication_aggregation,
+)
 from deduplication.tests.data.dedup_beneficiary import benefit_plan_data, individuals_data
 from deduplication.tests.helpers import LogInHelper
 from deduplication.schema import Query
@@ -127,6 +129,11 @@ class DedupBeneficiaryTestCase(TestCase):
         ))
         self.assertEqual(allowed[0]['id_count'], 2)
 
+        self.assertEqual(
+            _beneficiary_task_ownership([beneficiary.id for beneficiary in self.bens]),
+            {'benefit_plan_id': str(self.bp.id)},
+        )
+
         with self.assertRaises(PermissionDenied):
             get_beneficiary_duplication_aggregation(
                 ['individual__first_name'], self.bp.id, self.rmep_user,
@@ -197,11 +204,11 @@ class DedupBeneficiaryTestCase(TestCase):
         ))
         self.assertEqual(result[0]['id_count'], 2)
 
-    def test_enabled_mode_fails_closed_without_shared_service(self):
-        with patch.dict(
-            sys.modules,
-            {'social_protection.benefit_plan_access': None},
-        ), self.assertRaises(ImproperlyConfigured):
+    def test_enabled_mode_propagates_shared_authorization_denial(self):
+        with patch(
+            'deduplication.services.require_benefit_plan_access',
+            side_effect=PermissionDenied("denied"),
+        ), self.assertRaises(PermissionDenied):
             get_beneficiary_duplication_aggregation(
                 ['individual__first_name'], self.bp.id, self.upg_user,
             )

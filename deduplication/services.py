@@ -7,8 +7,8 @@ from datetime import datetime
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.exceptions import (
     FieldDoesNotExist,
-    ImproperlyConfigured,
     PermissionDenied,
+    ValidationError,
 )
 from django.db import models
 from django.db.models import Count, Q
@@ -27,13 +27,48 @@ from individual.models import Individual
 from invoice.models import Bill, BillItem
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus, \
     PayrollBenefitConsumption, PayrollStatus, BenefitAttachment
+from payroll.benefit_plan_access import task_ownership_for_benefit
 from payment_cycle.models import PaymentCycle
 from social_protection.models import Beneficiary, BenefitPlan
+from social_protection.benefit_plan_access import (
+    benefit_plan_access_control_enabled,
+    require_benefit_plan_access,
+)
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
 from tasks_management.services import TaskService
 
 logger = logging.getLogger(__name__)
+
+
+def _beneficiary_task_ownership(ids):
+    plan_ids = {
+        str(plan_id)
+        for plan_id in Beneficiary.objects.filter(
+            id__in=ids,
+            is_deleted=False,
+        ).values_list('benefit_plan_id', flat=True)
+    }
+    if len(plan_ids) != 1:
+        raise ValidationError(
+            "Deduplication Task must belong to one Benefit Plan."
+        )
+    return {'benefit_plan_id': plan_ids.pop()}
+
+
+def _payment_task_ownership(ids):
+    benefits = list(BenefitConsumption.objects.filter(
+        id__in=ids,
+        is_deleted=False,
+    ))
+    if len(benefits) != len(set(ids)):
+        raise ValidationError("Deduplication Task benefits are incomplete.")
+    ownerships = [task_ownership_for_benefit(benefit) for benefit in benefits]
+    if not ownerships or any(ownership != ownerships[0] for ownership in ownerships):
+        raise ValidationError(
+            "Deduplication Task must have one programme owner."
+        )
+    return ownerships[0]
 
 
 class CreateDeduplicationReviewTasksService:
@@ -43,7 +78,7 @@ class CreateDeduplicationReviewTasksService:
 
     def create_beneficiary_duplication_tasks(self, summary):
         try:
-            task_service = TaskService(self.user)
+            task_service = TaskService(self.user, trusted_internal=True)
             tasks = []
 
             for task_data in summary:
@@ -57,6 +92,7 @@ class CreateDeduplicationReviewTasksService:
                     ),
                     'business_event': '',
                     'data': task_data,
+                    **_beneficiary_task_ownership(task_data['ids']),
                 }
                 tasks.append(task_service.create(create_task_data))
 
@@ -158,7 +194,7 @@ class CreateDeduplicationPaymentReviewTasksService:
 
     def create_payment_benefit_duplication_tasks(self, summary, payment_cycle_id):
         try:
-            task_service = TaskService(self.user)
+            task_service = TaskService(self.user, trusted_internal=True)
             tasks = []
             payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
             for task_data in summary:
@@ -173,6 +209,7 @@ class CreateDeduplicationPaymentReviewTasksService:
                     'business_event': '',
                     'entity': payment_cycle,
                     'data': task_data,
+                    **_payment_task_ownership(task_data['ids']),
                 }
                 tasks.append(task_service.create(create_task_data))
                 self.flag_duplicated_benefit_payments(task_data)
@@ -276,29 +313,7 @@ class CreateDeduplicationPaymentReviewTasksService:
 
 
 def _require_beneficiary_deduplication_access(user, benefit_plan_id):
-    """Use Track 01 authorization lazily and preserve feature-OFF behavior."""
-    try:
-        from social_protection.apps import SocialProtectionConfig
-    except ImportError:
-        return
-
-    if not getattr(
-        SocialProtectionConfig,
-        'enable_benefit_plan_access_control',
-        False,
-    ):
-        return
-
-    try:
-        from social_protection.benefit_plan_access import (
-            require_benefit_plan_access,
-        )
-    except ImportError as exc:
-        raise ImproperlyConfigured(
-            "Benefit Plan access control is enabled, but the shared Social "
-            "Protection authorization service is unavailable."
-        ) from exc
-
+    """Apply the shared Social Protection authorization policy."""
     user = getattr(getattr(user, 'context', None), 'user', user)
     require_benefit_plan_access(user, benefit_plan_id)
 
@@ -322,39 +337,14 @@ def get_beneficiary_duplication_aggregation(
 
 def _filter_payment_deduplication_links(queryset, user):
     """Scope Payroll links and reject Payroll's legacy unrestricted fallback."""
-    from social_protection.apps import SocialProtectionConfig
-
-    if not getattr(
-        SocialProtectionConfig,
-        'enable_benefit_plan_access_control',
-        False,
-    ):
+    if not benefit_plan_access_control_enabled():
         return queryset
 
     user = getattr(getattr(user, 'context', None), 'user', user)
     if user is None or getattr(user, 'is_anonymous', False):
         raise PermissionDenied("Valid user context is required.")
 
-    try:
-        from social_protection.benefit_plan_access import (
-            get_accessible_benefit_plan_ids,
-        )
-    except ImportError as exc:
-        raise ImproperlyConfigured(
-            "Benefit Plan access control is enabled, but the shared Social "
-            "Protection authorization service is unavailable."
-        ) from exc
-
     from payroll import benefit_plan_access as payroll_access
-
-    if (
-        payroll_access.get_accessible_benefit_plan_ids
-        is not get_accessible_benefit_plan_ids
-    ):
-        raise ImproperlyConfigured(
-            "Payroll Benefit Plan filtering is using an unrestricted "
-            "authorization fallback while access control is enabled."
-        )
 
     return payroll_access.filter_payroll_queryset(
         queryset,
