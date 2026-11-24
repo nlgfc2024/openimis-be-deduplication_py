@@ -28,16 +28,27 @@ class Query(graphene.ObjectType):
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
-        from deduplication.services import get_beneficiary_duplication_aggregation
+        from deduplication.services import (
+            _require_beneficiary_deduplication_access,
+            get_beneficiary_duplication_aggregation,
+        )
 
         Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
+        _require_beneficiary_deduplication_access(
+            info.context.user,
+            benefit_plan_id,
+        )
 
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
 
         individual_columns = list(DeduplicationConfig.individual_basic_fields)
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
-        aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
+        aggr = get_beneficiary_duplication_aggregation(
+            columns=columns,
+            benefit_plan_id=benefit_plan_id,
+            user=info.context.user,
+        )
         rows = []
         for row in aggr:
             count = row.pop('id_count')
@@ -63,7 +74,11 @@ class Query(graphene.ObjectType):
         columns = [f'{column}' if column in individual_columns else column for column in columns]
 
         # Fetch the aggregation data
-        aggr = get_benefit_consumption_duplication_aggregation(columns=columns, payment_cycle_id=payment_cycle_id)
+        aggr = get_benefit_consumption_duplication_aggregation(
+            columns=columns,
+            payment_cycle_id=payment_cycle_id,
+            user=info.context.user,
+        )
         rows = []
         for row in aggr:
             count = row.pop('id_count')
