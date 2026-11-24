@@ -1,12 +1,14 @@
 import copy
 import logging
 from functools import lru_cache
+from importlib import import_module
 from typing import List, Union, Tuple, Type
 from datetime import datetime
 
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.exceptions import (
     FieldDoesNotExist,
+    ImproperlyConfigured,
     PermissionDenied,
     ValidationError,
 )
@@ -27,7 +29,6 @@ from individual.models import Individual
 from invoice.models import Bill, BillItem
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus, \
     PayrollBenefitConsumption, PayrollStatus, BenefitAttachment
-from payroll.benefit_plan_access import task_ownership_for_benefit
 from payment_cycle.models import PaymentCycle
 from social_protection.models import Beneficiary, BenefitPlan
 from social_protection.benefit_plan_access import (
@@ -41,34 +42,95 @@ from tasks_management.services import TaskService
 logger = logging.getLogger(__name__)
 
 
-def _beneficiary_task_ownership(ids):
+def _payroll_benefit_plan_access():
+    """Load Payroll's optional authorization contract only when it is needed."""
+    try:
+        return import_module('payroll.benefit_plan_access')
+    except ImportError as exc:
+        raise ImproperlyConfigured(
+            "Benefit Plan access is enabled, but Payroll authorization is "
+            "unavailable."
+        ) from exc
+
+
+def _beneficiary_task_ownership(ids, user=None):
+    if not benefit_plan_access_control_enabled():
+        return {}
+
+    supplied_ids = {str(value) for value in ids}
+    beneficiaries = list(Beneficiary.objects.filter(
+        id__in=ids,
+        is_deleted=False,
+        benefit_plan__is_deleted=False,
+    ).select_related('benefit_plan'))
+    if {str(beneficiary.id) for beneficiary in beneficiaries} != supplied_ids:
+        raise ValidationError(
+            "Deduplication Task beneficiaries are missing or deleted."
+        )
     plan_ids = {
-        str(plan_id)
-        for plan_id in Beneficiary.objects.filter(
-            id__in=ids,
-            is_deleted=False,
-        ).values_list('benefit_plan_id', flat=True)
+        str(beneficiary.benefit_plan_id) for beneficiary in beneficiaries
     }
     if len(plan_ids) != 1:
         raise ValidationError(
             "Deduplication Task must belong to one Benefit Plan."
         )
-    return {'benefit_plan_id': plan_ids.pop()}
+    plan_id = plan_ids.pop()
+    require_benefit_plan_access(user, plan_id)
+    return {'benefit_plan_id': plan_id}
 
 
-def _payment_task_ownership(ids):
+def _payment_task_ownership(ids, user=None, payment_cycle_id=None):
+    if not benefit_plan_access_control_enabled():
+        return {}
+
+    payroll_access = _payroll_benefit_plan_access()
+    supplied_ids = {str(value) for value in ids}
     benefits = list(BenefitConsumption.objects.filter(
         id__in=ids,
         is_deleted=False,
     ))
-    if len(benefits) != len(set(ids)):
-        raise ValidationError("Deduplication Task benefits are incomplete.")
-    ownerships = [task_ownership_for_benefit(benefit) for benefit in benefits]
+    if {str(benefit.id) for benefit in benefits} != supplied_ids:
+        raise ValidationError(
+            "Deduplication Task benefits are missing or deleted."
+        )
+    cycle_benefit_ids = {
+        str(value)
+        for value in PayrollBenefitConsumption.objects.filter(
+            benefit_id__in=ids,
+            is_deleted=False,
+            payroll__is_deleted=False,
+            payroll__payment_cycle_id=payment_cycle_id,
+            payroll__status=PayrollStatus.PENDING_APPROVAL,
+        ).values_list('benefit_id', flat=True)
+    }
+    if cycle_benefit_ids != supplied_ids:
+        raise ValidationError(
+            "Deduplication Task benefits do not belong to the Payment Cycle."
+        )
+    ownerships = [
+        payroll_access.task_ownership_for_benefit(benefit)
+        for benefit in benefits
+    ]
     if not ownerships or any(ownership != ownerships[0] for ownership in ownerships):
         raise ValidationError(
             "Deduplication Task must have one programme owner."
         )
-    return ownerships[0]
+    ownership = ownerships[0]
+    plan_id = ownership.get('benefit_plan_id')
+    if plan_id:
+        require_benefit_plan_access(user, plan_id)
+    elif ownership.get('benefit_plan_is_shared') is not True:
+        raise ValidationError(
+            "Deduplication Task programme ownership is unresolved."
+        )
+    return ownership
+
+
+def _require_successful_task_result(result):
+    if not isinstance(result, dict) or result.get('success') is not True:
+        detail = result.get('detail') if isinstance(result, dict) else None
+        raise ValidationError(detail or "Deduplication Task creation failed.")
+    return result
 
 
 class CreateDeduplicationReviewTasksService:
@@ -78,11 +140,13 @@ class CreateDeduplicationReviewTasksService:
 
     def create_beneficiary_duplication_tasks(self, summary):
         try:
-            task_service = TaskService(self.user, trusted_internal=True)
-            tasks = []
-
+            prepared_tasks = []
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
+                ownership = _beneficiary_task_ownership(
+                    task_data['ids'],
+                    self.user,
+                )
                 create_task_data = {
                     'source': self.get_class_name(),
                     'executor_action_event': TasksManagementConfig.default_executor_event,
@@ -92,9 +156,21 @@ class CreateDeduplicationReviewTasksService:
                     ),
                     'business_event': '',
                     'data': task_data,
-                    **_beneficiary_task_ownership(task_data['ids']),
+                    **ownership,
                 }
-                tasks.append(task_service.create(create_task_data))
+                prepared_tasks.append((create_task_data, ownership))
+
+            tasks = []
+            with transaction.atomic():
+                for create_task_data, ownership in prepared_tasks:
+                    task_service = TaskService(
+                        self.user,
+                        trusted_internal=(
+                            ownership.get('benefit_plan_is_shared') is True
+                        ),
+                    )
+                    result = task_service.create(create_task_data)
+                    tasks.append(_require_successful_task_result(result))
 
             return {
                 "success": True, "message": "Ok", "detail": "", "data": tasks,
@@ -194,11 +270,18 @@ class CreateDeduplicationPaymentReviewTasksService:
 
     def create_payment_benefit_duplication_tasks(self, summary, payment_cycle_id):
         try:
-            task_service = TaskService(self.user, trusted_internal=True)
-            tasks = []
-            payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
+            payment_cycle_query = PaymentCycle.objects.filter(id=payment_cycle_id)
+            if benefit_plan_access_control_enabled():
+                payment_cycle_query = payment_cycle_query.filter(is_deleted=False)
+            payment_cycle = payment_cycle_query.get()
+            prepared_tasks = []
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
+                ownership = _payment_task_ownership(
+                    task_data['ids'],
+                    self.user,
+                    payment_cycle_id,
+                )
                 create_task_data = {
                     'source': self.get_class_name(),
                     'executor_action_event': TasksManagementConfig.default_executor_event,
@@ -209,10 +292,23 @@ class CreateDeduplicationPaymentReviewTasksService:
                     'business_event': '',
                     'entity': payment_cycle,
                     'data': task_data,
-                    **_payment_task_ownership(task_data['ids']),
+                    **ownership,
                 }
-                tasks.append(task_service.create(create_task_data))
-                self.flag_duplicated_benefit_payments(task_data)
+                prepared_tasks.append((create_task_data, ownership, task_data))
+
+            tasks = []
+            with transaction.atomic():
+                for create_task_data, ownership, _ in prepared_tasks:
+                    task_service = TaskService(
+                        self.user,
+                        trusted_internal=(
+                            ownership.get('benefit_plan_is_shared') is True
+                        ),
+                    )
+                    result = task_service.create(create_task_data)
+                    tasks.append(_require_successful_task_result(result))
+                for _, _, task_data in prepared_tasks:
+                    self.flag_duplicated_benefit_payments(task_data)
             return {
                 "success": True, "message": "Ok", "detail": "", "data": tasks,
             }
@@ -344,7 +440,7 @@ def _filter_payment_deduplication_links(queryset, user):
     if user is None or getattr(user, 'is_anonymous', False):
         raise PermissionDenied("Valid user context is required.")
 
-    from payroll import benefit_plan_access as payroll_access
+    payroll_access = _payroll_benefit_plan_access()
 
     return payroll_access.filter_payroll_queryset(
         queryset,
@@ -364,6 +460,23 @@ def get_benefit_consumption_duplication_aggregation(
         raise ValueError("Payment Cycle not specified")
 
     db_columns, json_keys = _resolve_columns(Individual, columns)
+    if not benefit_plan_access_control_enabled():
+        benefit_consumption_ids = PayrollBenefitConsumption.objects.filter(
+            payroll__payment_cycle_id=payment_cycle_id,
+            payroll__status=PayrollStatus.PENDING_APPROVAL,
+        ).values_list('benefit_id', flat=True)
+        filters = [
+            Q(id__in=benefit_consumption_ids),
+            Q(is_deleted=False),
+            Q(status=BenefitConsumptionStatus.ACCEPTED),
+        ]
+        return get_duplication_benefit_aggregation(
+            BenefitConsumption,
+            columns=db_columns,
+            json_ext_keys=json_keys,
+            filters=filters,
+        )
+
     cycle_links = PayrollBenefitConsumption.objects.filter(
         is_deleted=False,
         payroll__payment_cycle_id=payment_cycle_id,
