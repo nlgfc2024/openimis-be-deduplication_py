@@ -5,7 +5,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.test import TestCase, override_settings
 
 from contribution_plan.models import PaymentPlan
@@ -16,6 +16,7 @@ from core.test_helpers import (
 )
 from deduplication.schema import Query
 from deduplication.services import (
+    CreateDeduplicationPaymentReviewTasksService,
     _payment_task_ownership,
     get_benefit_consumption_duplication_aggregation,
 )
@@ -30,6 +31,8 @@ from payroll.models import (
 )
 from social_protection.apps import SocialProtectionConfig
 from social_protection.models import BenefitPlan, UserBenefitPlanAccess
+from tasks_management.models import Task
+from tasks_management.services import TaskService
 
 
 @override_settings(ROW_SECURITY=False)
@@ -235,13 +238,17 @@ class PaymentDeduplicationAccessTest(TestCase):
         })
         self.assertEqual(
             _payment_task_ownership(
-                [benefit.id for benefit in self.upg_benefits]
+                [benefit.id for benefit in self.upg_benefits],
+                self.upg_user,
+                self.cycle.id,
             ),
             {'benefit_plan_id': str(self.upg_plan.id)},
         )
         self.assertEqual(
             _payment_task_ownership(
-                [benefit.id for benefit in self.legacy_benefits]
+                [benefit.id for benefit in self.legacy_benefits],
+                self.none_user,
+                self.cycle.id,
             ),
             {'benefit_plan_is_shared': True},
         )
@@ -322,3 +329,227 @@ class PaymentDeduplicationAccessTest(TestCase):
             side_effect=PermissionDenied("denied"),
         ), self.assertRaises(PermissionDenied):
             self.summary(self.upg_user)
+
+    def task_summary(self, benefits):
+        return {
+            'count': len(benefits),
+            'ids': [str(benefit.id) for benefit in benefits],
+            'column_values': {'individual__first_name': 'duplicate'},
+        }
+
+    def task_count(self):
+        return Task.objects.filter(
+            source=(
+                CreateDeduplicationPaymentReviewTasksService.get_class_name()
+            ),
+            is_deleted=False,
+        ).count()
+
+    def assert_not_flagged(self, benefits):
+        for benefit in benefits:
+            benefit.refresh_from_db()
+            self.assertNotIn('duplicated', benefit.json_ext or {})
+
+    def test_task_creation_authorizes_every_id_and_programme(self):
+        authorized = CreateDeduplicationPaymentReviewTasksService(
+            self.upg_user,
+        ).create_payment_benefit_duplication_tasks(
+            [self.task_summary(self.upg_benefits)],
+            self.cycle.id,
+        )
+        self.assertTrue(authorized['success'])
+        task = Task.objects.get(
+            source=(
+                CreateDeduplicationPaymentReviewTasksService.get_class_name()
+            ),
+            is_deleted=False,
+        )
+        self.assertEqual(str(task.benefit_plan_id), str(self.upg_plan.id))
+        self.assertFalse(task.benefit_plan_is_shared)
+
+    def test_task_creation_rejects_unauthorized_missing_and_mixed_ids(self):
+        cases = (
+            (
+                self.rmep_user,
+                self.task_summary(self.upg_benefits),
+            ),
+            (
+                self.upg_user,
+                {
+                    'count': 1,
+                    'ids': [str(uuid4())],
+                    'column_values': {'individual__first_name': 'missing'},
+                },
+            ),
+            (
+                self.both_user,
+                self.task_summary([
+                    self.upg_benefits[0],
+                    self.rmep_benefits[0],
+                ]),
+            ),
+            (
+                self.both_user,
+                self.task_summary(self.cross_benefits),
+            ),
+        )
+
+        for user, summary in cases:
+            with self.subTest(user=user.username, ids=summary['ids']):
+                result = CreateDeduplicationPaymentReviewTasksService(
+                    user,
+                ).create_payment_benefit_duplication_tasks(
+                    [summary],
+                    self.cycle.id,
+                )
+                self.assertFalse(result['success'])
+                self.assertEqual(self.task_count(), 0)
+
+    def test_task_creation_rejects_payment_cycle_mismatch(self):
+        other_cycle = PaymentCycle(
+            code='T09-OTHER-CYCLE',
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            type=ContentType.objects.get_for_model(BenefitPlan),
+        )
+        other_cycle.save(username=self.admin.username)
+
+        result = CreateDeduplicationPaymentReviewTasksService(
+            self.upg_user,
+        ).create_payment_benefit_duplication_tasks(
+            [self.task_summary(self.upg_benefits)],
+            other_cycle.id,
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.task_count(), 0)
+        self.assert_not_flagged(self.upg_benefits)
+
+    def test_task_creation_rejects_deleted_benefits(self):
+        BenefitConsumption.objects.filter(
+            pk=self.upg_benefits[0].id,
+        ).update(is_deleted=True)
+
+        result = CreateDeduplicationPaymentReviewTasksService(
+            self.upg_user,
+        ).create_payment_benefit_duplication_tasks(
+            [self.task_summary(self.upg_benefits)],
+            self.cycle.id,
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.task_count(), 0)
+
+    def test_failed_task_result_does_not_flag_benefits(self):
+        failed_result = {
+            'success': False,
+            'message': 'failed',
+            'detail': 'simulated Task failure',
+            'data': '',
+        }
+        with patch(
+            'deduplication.services.TaskService.create',
+            return_value=failed_result,
+        ):
+            result = CreateDeduplicationPaymentReviewTasksService(
+                self.upg_user,
+            ).create_payment_benefit_duplication_tasks(
+                [self.task_summary(self.upg_benefits)],
+                self.cycle.id,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.task_count(), 0)
+        self.assert_not_flagged(self.upg_benefits)
+
+    def test_later_task_failure_rolls_back_tasks_and_flags(self):
+        original_create = TaskService.create
+        calls = 0
+
+        def fail_second_create(task_service, task_data):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return {
+                    'success': False,
+                    'message': 'failed',
+                    'detail': 'simulated second Task failure',
+                    'data': '',
+                }
+            return original_create(task_service, task_data)
+
+        with patch.object(
+            TaskService,
+            'create',
+            autospec=True,
+            side_effect=fail_second_create,
+        ):
+            result = CreateDeduplicationPaymentReviewTasksService(
+                self.upg_user,
+            ).create_payment_benefit_duplication_tasks(
+                [
+                    self.task_summary([self.upg_benefits[0]]),
+                    self.task_summary([self.upg_benefits[1]]),
+                ],
+                self.cycle.id,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.task_count(), 0)
+        self.assert_not_flagged(self.upg_benefits)
+
+    def test_verified_legacy_shared_records_use_trusted_creation(self):
+        result = CreateDeduplicationPaymentReviewTasksService(
+            self.none_user,
+        ).create_payment_benefit_duplication_tasks(
+            [self.task_summary(self.legacy_benefits)],
+            self.cycle.id,
+        )
+
+        self.assertTrue(result['success'])
+        task = Task.objects.get(
+            source=(
+                CreateDeduplicationPaymentReviewTasksService.get_class_name()
+            ),
+            is_deleted=False,
+        )
+        self.assertIsNone(task.benefit_plan_id)
+        self.assertTrue(task.benefit_plan_is_shared)
+
+    def test_enabled_mode_fails_closed_without_payroll_authorization(self):
+        with patch(
+            'deduplication.services._payroll_benefit_plan_access',
+            side_effect=ImproperlyConfigured('unavailable'),
+        ):
+            result = CreateDeduplicationPaymentReviewTasksService(
+                self.upg_user,
+            ).create_payment_benefit_duplication_tasks(
+                [self.task_summary(self.upg_benefits)],
+                self.cycle.id,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(self.task_count(), 0)
+        self.assert_not_flagged(self.upg_benefits)
+
+    def test_feature_off_keeps_legacy_links_and_skips_ownership(self):
+        PayrollBenefitConsumption.objects.filter(
+            benefit__in=self.rmep_benefits,
+        ).update(is_deleted=True)
+        SocialProtectionConfig.enable_benefit_plan_access_control = False
+
+        rows = list(get_benefit_consumption_duplication_aggregation(
+            ['first_name'], self.cycle.id,
+        ))
+
+        self.assertIn(
+            'RMEP duplicate',
+            {row['individual__first_name'] for row in rows},
+        )
+        self.assertEqual(
+            _payment_task_ownership(
+                [uuid4()],
+                payment_cycle_id=uuid4(),
+            ),
+            {},
+        )

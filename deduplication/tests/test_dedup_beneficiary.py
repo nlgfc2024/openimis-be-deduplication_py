@@ -5,6 +5,7 @@ from django.core.exceptions import PermissionDenied
 from django.test import TestCase, override_settings
 from django.db import connection
 from deduplication.services import (
+    CreateDeduplicationReviewTasksService,
     _beneficiary_task_ownership,
     get_beneficiary_duplication_aggregation,
 )
@@ -20,6 +21,7 @@ from social_protection.models import (
     BeneficiaryStatus,
     UserBenefitPlanAccess,
 )
+from tasks_management.models import Task
 
 
 @override_settings(ROW_SECURITY=False)
@@ -130,7 +132,10 @@ class DedupBeneficiaryTestCase(TestCase):
         self.assertEqual(allowed[0]['id_count'], 2)
 
         self.assertEqual(
-            _beneficiary_task_ownership([beneficiary.id for beneficiary in self.bens]),
+            _beneficiary_task_ownership(
+                [beneficiary.id for beneficiary in self.bens],
+                self.upg_user,
+            ),
             {'benefit_plan_id': str(self.bp.id)},
         )
 
@@ -212,3 +217,92 @@ class DedupBeneficiaryTestCase(TestCase):
             get_beneficiary_duplication_aggregation(
                 ['individual__first_name'], self.bp.id, self.upg_user,
             )
+
+    def task_summary(self, beneficiaries=None):
+        beneficiaries = beneficiaries or self.bens
+        return {
+            'count': len(beneficiaries),
+            'ids': [str(beneficiary.id) for beneficiary in beneficiaries],
+            'column_values': {'individual__first_name': 'duplicate'},
+        }
+
+    def test_task_creation_preflights_authorization_and_all_ids(self):
+        service = CreateDeduplicationReviewTasksService(self.upg_user)
+        result = service.create_beneficiary_duplication_tasks([
+            self.task_summary(),
+            {
+                'count': 1,
+                'ids': [str(self.rmep_bp.id)],
+                'column_values': {'individual__first_name': 'missing'},
+            },
+        ])
+
+        self.assertFalse(result['success'])
+        self.assertEqual(
+            Task.objects.filter(
+                source=service.get_class_name(),
+                is_deleted=False,
+            ).count(),
+            0,
+        )
+
+        unauthorized = CreateDeduplicationReviewTasksService(
+            self.rmep_user,
+        ).create_beneficiary_duplication_tasks([self.task_summary()])
+        self.assertFalse(unauthorized['success'])
+
+    def test_task_creation_rejects_mixed_programmes(self):
+        other_individual = Individual(**{
+            **individuals_data[0],
+            'first_name': 'other programme',
+        })
+        other_individual.save(username=self.user.username)
+        other_beneficiary = Beneficiary(
+            individual=other_individual,
+            benefit_plan=self.rmep_bp,
+            status=BeneficiaryStatus.ACTIVE,
+            json_ext={},
+        )
+        other_beneficiary.save(username=self.user.username)
+
+        result = CreateDeduplicationReviewTasksService(
+            self.both_user,
+        ).create_beneficiary_duplication_tasks([
+            self.task_summary([self.bens[0], other_beneficiary]),
+        ])
+
+        self.assertFalse(result['success'])
+        self.assertEqual(Task.objects.filter(
+            source=CreateDeduplicationReviewTasksService.get_class_name(),
+            is_deleted=False,
+        ).count(), 0)
+
+    def test_task_creation_rejects_deleted_beneficiaries(self):
+        Beneficiary.objects.filter(pk=self.bens[0].id).update(is_deleted=True)
+
+        result = CreateDeduplicationReviewTasksService(
+            self.upg_user,
+        ).create_beneficiary_duplication_tasks([self.task_summary()])
+
+        self.assertFalse(result['success'])
+        self.assertEqual(Task.objects.filter(
+            source=CreateDeduplicationReviewTasksService.get_class_name(),
+            is_deleted=False,
+        ).count(), 0)
+
+    def test_authorized_task_uses_normal_programme_authorization(self):
+        result = CreateDeduplicationReviewTasksService(
+            self.upg_user,
+        ).create_beneficiary_duplication_tasks([self.task_summary()])
+
+        self.assertTrue(result['success'])
+        task = Task.objects.get(
+            source=CreateDeduplicationReviewTasksService.get_class_name(),
+            is_deleted=False,
+        )
+        self.assertEqual(str(task.benefit_plan_id), str(self.bp.id))
+        self.assertFalse(task.benefit_plan_is_shared)
+
+    def test_task_ownership_is_a_noop_when_feature_is_off(self):
+        SocialProtectionConfig.enable_benefit_plan_access_control = False
+        self.assertEqual(_beneficiary_task_ownership([self.rmep_bp.id]), {})
